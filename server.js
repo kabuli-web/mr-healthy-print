@@ -4,7 +4,7 @@ const net = require("net");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execSync, execFileSync } = require("child_process");
+const { execSync, execFile } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -207,14 +207,21 @@ $doc.Dispose()
   const bom2 = Buffer.from([0xef, 0xbb, 0xbf]);
   fs.writeFileSync(psFile, Buffer.concat([bom2, Buffer.from(script, "utf8")]));
 
-  try {
-    execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psFile], {
-      timeout: 15000,
-    });
-  } finally {
-    try { fs.unlinkSync(jsonFile); } catch {}
-    try { fs.unlinkSync(psFile);   } catch {}
-  }
+  // -STA: Single Threaded Apartment — required for GDI/System.Drawing in headless PS
+  // execFile (async) so multiple print jobs run in parallel, not sequentially
+  return new Promise((resolve, reject) => {
+    execFile(
+      "powershell",
+      ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", psFile],
+      { timeout: 20000 },
+      (err) => {
+        try { fs.unlinkSync(jsonFile); } catch {}
+        try { fs.unlinkSync(psFile);   } catch {}
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
 }
 
 // ── TCP raw ESC/POS sender ────────────────────────────────────────────────────
