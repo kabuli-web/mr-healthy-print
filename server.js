@@ -43,55 +43,53 @@ app.get("/printers", (_req, res) => {
 
 app.post("/print", async (req, res) => {
   const { printerName, order } = req.body || {};
+
   if (!printerName)
     return res.status(400).json({ success: false, error: "printerName is required" });
   if (!order)
     return res.status(400).json({ success: false, error: "order is required" });
 
+  // ── Log the job ──
+  const ts = new Date().toISOString();
+  console.log(`\n╔══ PRINT JOB ${ts} ══╗`);
+  console.log(`  Printer  : ${printerName}`);
+  console.log(`  Order    : ${order.orderNumber}`);
+  console.log(`  Customer : ${order.customerName} / ${order.customerPhone}`);
+  console.log(`  Branch   : ${order.branchName || "-"}`);
+  console.log(`  Type     : ${order.dineType || "-"} / ${order.fulfillmentType || "-"}`);
+  console.log(`  Items    :`);
+  for (const item of order.items || []) {
+    console.log(`    ${item.quantity}x ${item.name}`);
+    for (const a of item.selectedAddons || []) {
+      const qty = a.quantity ?? 1;
+      console.log(`       + ${a.option?.name ?? ""}${qty > 1 ? ` x${qty}` : ""}`);
+    }
+  }
+  if (order.note) console.log(`  Note     : ${order.note}`);
+
   try {
-    const buffer = buildReceiptBuffer(order);
+    const lines = buildReceiptLines(order);
 
     if (printerName.toUpperCase().startsWith("TCP:")) {
       const parts = printerName.split(":");
-      await sendTcp(parts[1], parseInt(parts[2]) || 9100, buffer);
+      await sendTcp(parts[1], parseInt(parts[2]) || 9100, lines);
     } else {
-      await sendWindowsPrinter(printerName, buffer);
+      await sendWindowsPrinter(printerName, lines);
     }
 
+    console.log(`  Result   : SUCCESS`);
+    console.log(`╚${"═".repeat(50)}╝`);
     res.json({ success: true });
   } catch (err) {
-    console.error(`Print error [${printerName}]:`, err.message);
+    console.error(`  Result   : FAILED — ${err.message}`);
+    console.log(`╚${"═".repeat(50)}╝`);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Arabic helper ────────────────────────────────────────────────────────────
-// Unicode Arabic is in abstract/base form; PC864 expects visual presentation
-// forms. Reshape converts each character to the right isolated/initial/medial/
-// final form based on context, then iconv-lite encodes the result to CP864 bytes.
+// ── Receipt lines builder ────────────────────────────────────────────────────
 
-const iconv = require("iconv-lite");
-const { reshape } = require("arabic-reshaper");
-
-function ar(text) {
-  return iconv.encode(reshape(text), "CP864");
-}
-
-// ── Receipt builder (returns raw ESC/POS Buffer) ─────────────────────────────
-
-function buildReceiptBuffer(order) {
-  const { ThermalPrinter, PrinterTypes, CharacterSet } = require("node-thermal-printer");
-
-  // Dummy TCP interface — we only call getBuffer(), never execute()
-  const printer = new ThermalPrinter({
-    type: PrinterTypes.EPSON,
-    interface: "tcp://127.0.0.1:19999",
-    characterSet: CharacterSet.PC864_ARABIC,
-    removeSpecialCharacters: false,
-    lineCharacter: "-",
-    width: 42,
-  });
-
+function buildReceiptLines(order) {
   const now = new Date().toLocaleString("ar-SA", {
     hour: "2-digit",
     minute: "2-digit",
@@ -99,53 +97,150 @@ function buildReceiptBuffer(order) {
     timeZone: "Asia/Riyadh",
   });
 
-  printer.alignCenter();
-  printer.bold(true);
-  printer.append(ar("مستر صحي")); printer.newLine();
-  printer.bold(false);
-  printer.drawLine();
+  const lines = [];
+  const add = (text, opts = {}) => lines.push({ text, ...opts });
 
-  printer.alignRight();
-  printer.append(ar(`طلب رقم: ${String(order.orderNumber || "").slice(-6)}`)); printer.newLine();
-  printer.append(ar(`الوقت: ${now}`)); printer.newLine();
-  printer.drawLine();
-
-  printer.append(ar(`العميل: ${order.customerName || ""}`)); printer.newLine();
-  if (order.customerPhone) { printer.append(ar(`الجوال: ${order.customerPhone}`)); printer.newLine(); }
-  if (order.branchName)    { printer.append(ar(`الفرع: ${order.branchName}`));      printer.newLine(); }
-  if (order.dineType)      { printer.append(ar(order.dineType === "dine_in" ? "محلي" : "سفري")); printer.newLine(); }
-  if (order.fulfillmentType === "delivery") { printer.append(ar("توصيل")); printer.newLine(); }
-
-  printer.drawLine();
+  add("مستر صحي", { bold: true, center: true, large: true });
+  add("---");
+  add(`طلب رقم: ${String(order.orderNumber || "").slice(-6)}`);
+  add(`الوقت: ${now}`);
+  add("---");
+  add(`العميل: ${order.customerName || ""}`);
+  if (order.customerPhone) add(`الجوال: ${order.customerPhone}`);
+  if (order.branchName)    add(`الفرع: ${order.branchName}`);
+  if (order.dineType)      add(order.dineType === "dine_in" ? "نوع الطلب: محلي" : "نوع الطلب: سفري");
+  if (order.fulfillmentType === "delivery") add("طريقة التسليم: توصيل");
+  add("---");
 
   for (const item of order.items || []) {
-    printer.bold(true);
-    printer.append(ar(`${item.quantity}x ${item.name}`)); printer.newLine();
-    printer.bold(false);
-    if (item.selectedAddons?.length) {
-      for (const addon of item.selectedAddons) {
-        const qty = addon.quantity ?? 1;
-        printer.append(ar(`  - ${addon.option?.name ?? ""}${qty > 1 ? ` x${qty}` : ""}`)); printer.newLine();
-      }
+    add(`${item.quantity}x  ${item.name}`, { bold: true });
+    for (const addon of item.selectedAddons || []) {
+      const qty = addon.quantity ?? 1;
+      add(`    - ${addon.option?.name ?? ""}${qty > 1 ? ` x${qty}` : ""}`);
     }
   }
 
-  printer.drawLine();
+  add("---");
 
   if (order.note) {
-    printer.bold(true);
-    printer.append(ar(`ملاحظة: ${order.note}`)); printer.newLine();
-    printer.bold(false);
-    printer.drawLine();
+    add(`ملاحظة: ${order.note}`, { bold: true });
+    add("---");
   }
 
-  printer.cut();
-  return printer.getBuffer();
+  return lines;
 }
 
-// ── TCP sender (raw socket, no extra packages) ───────────────────────────────
+// ── Windows named-printer via GDI+ (PowerShell) ─────────────────────────────
+// Windows handles Arabic shaping + RTL — no encoding tricks needed.
 
-function sendTcp(host, port, buffer) {
+function sendWindowsPrinter(printerName, lines) {
+  const id = Date.now();
+  const jsonFile = path.join(os.tmpdir(), `mrh_${id}.json`);
+  const psFile   = path.join(os.tmpdir(), `mrh_${id}.ps1`);
+
+  // Write JSON with UTF-8 BOM so PowerShell reads it correctly
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  fs.writeFileSync(jsonFile, Buffer.concat([bom, Buffer.from(JSON.stringify(lines), "utf8")]));
+
+  const safeJson    = jsonFile.replace(/\\/g, "\\\\");
+  const safePrinter = printerName.replace(/'/g, "''");
+
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+
+$lines = [System.IO.File]::ReadAllText('${safeJson}', [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+
+$doc = New-Object System.Drawing.Printing.PrintDocument
+$doc.PrinterSettings.PrinterName = '${safePrinter}'
+
+if (-not $doc.PrinterSettings.IsValid) {
+    throw "Printer not found: '${safePrinter}'"
+}
+
+# 80 mm wide = ~227 points (at 72 dpi) but PrintDocument uses hundredths of an inch
+# 80 mm = 3.15 inch = 315 units; height 2000 = 20 inch (thermal scrolls)
+$doc.DefaultPageSettings.PaperSize    = New-Object System.Drawing.Printing.PaperSize('Receipt', 315, 2000)
+$doc.DefaultPageSettings.Margins      = New-Object System.Drawing.Printing.Margins(15, 15, 10, 10)
+$doc.DefaultPageSettings.Landscape    = $false
+
+$doc.Add_PrintPage({
+    param($s, $e)
+
+    $normalFont = New-Object System.Drawing.Font('Tahoma', 9)
+    $boldFont   = New-Object System.Drawing.Font('Tahoma', 9,  [System.Drawing.FontStyle]::Bold)
+    $titleFont  = New-Object System.Drawing.Font('Tahoma', 13, [System.Drawing.FontStyle]::Bold)
+
+    $rtl = New-Object System.Drawing.StringFormat
+    $rtl.FormatFlags   = [System.Drawing.StringFormatFlags]::DirectionRightToLeft
+    $rtl.Alignment     = [System.Drawing.StringAlignment]::Near
+    $rtl.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+    $center = New-Object System.Drawing.StringFormat
+    $center.Alignment     = [System.Drawing.StringAlignment]::Center
+    $center.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+    $pageW = [float]$e.MarginBounds.Width
+    $x     = [float]$e.MarginBounds.Left
+    $y     = [float]$e.MarginBounds.Top
+
+    foreach ($line in $lines) {
+        if ($line.text -eq '---') {
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 0.5)
+            $e.Graphics.DrawLine($pen, $x, ($y + 5), ($x + $pageW), ($y + 5))
+            $y += 14
+            continue
+        }
+
+        $font = if ($line.large) { $titleFont } elseif ($line.bold) { $boldFont } else { $normalFont }
+        $fmt  = if ($line.center) { $center } else { $rtl }
+        $rect = New-Object System.Drawing.RectangleF($x, $y, $pageW, 28)
+        $e.Graphics.DrawString($line.text, $font, [System.Drawing.Brushes]::Black, $rect, $fmt)
+        $y += if ($line.large) { 26 } else { 20 }
+    }
+})
+
+$doc.Print()
+$doc.Dispose()
+`;
+
+  const bom2 = Buffer.from([0xef, 0xbb, 0xbf]);
+  fs.writeFileSync(psFile, Buffer.concat([bom2, Buffer.from(script, "utf8")]));
+
+  try {
+    execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psFile], {
+      timeout: 15000,
+    });
+  } finally {
+    try { fs.unlinkSync(jsonFile); } catch {}
+    try { fs.unlinkSync(psFile);   } catch {}
+  }
+}
+
+// ── TCP raw ESC/POS sender ────────────────────────────────────────────────────
+// Sends UTF-8 bytes — requires the printer to have UTF-8 mode enabled.
+
+function sendTcp(host, port, lines) {
+  const ESC = 0x1b;
+  const GS  = 0x1d;
+  const parts = [Buffer.from([ESC, 0x40])]; // initialize
+
+  for (const line of lines) {
+    if (line.text === "---") {
+      parts.push(Buffer.from("--------------------------------\n", "ascii"));
+      continue;
+    }
+    if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x01]));
+    if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x01]));
+    parts.push(Buffer.from(line.text + "\n", "utf8"));
+    if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x00]));
+    if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x00]));
+  }
+
+  parts.push(Buffer.from([GS, 0x56, 0x41, 0x10])); // full cut
+
+  const buffer = Buffer.concat(parts);
+
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host, port });
     const timer = setTimeout(() => {
@@ -166,84 +261,10 @@ function sendTcp(host, port, buffer) {
   });
 }
 
-// ── Windows named-printer sender (PowerShell P/Invoke, no native packages) ───
-
-function sendWindowsPrinter(printerName, buffer) {
-  const id = Date.now();
-  const binFile = path.join(os.tmpdir(), `mrh_${id}.bin`);
-  const psFile = path.join(os.tmpdir(), `mrh_${id}.ps1`);
-
-  fs.writeFileSync(binFile, buffer);
-
-  // Single-quote escape for PowerShell string literals
-  const safeBin = binFile.replace(/\\/g, "\\\\");
-  const safeName = printerName.replace(/'/g, "''");
-
-  const script = `
-$ErrorActionPreference = 'Stop'
-$bytes = [System.IO.File]::ReadAllBytes('${safeBin}')
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class RawPrint {
-    [DllImport("winspool.drv", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool OpenPrinter(string n, out IntPtr h, IntPtr d);
-    [DllImport("winspool.drv", SetLastError=true)]
-    public static extern bool ClosePrinter(IntPtr h);
-    [DllImport("winspool.drv", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern int StartDocPrinter(IntPtr h, int lvl, ref DOCINFO info);
-    [DllImport("winspool.drv", SetLastError=true)]
-    public static extern bool EndDocPrinter(IntPtr h);
-    [DllImport("winspool.drv", SetLastError=true)]
-    public static extern bool StartPagePrinter(IntPtr h);
-    [DllImport("winspool.drv", SetLastError=true)]
-    public static extern bool EndPagePrinter(IntPtr h);
-    [DllImport("winspool.drv", SetLastError=true)]
-    public static extern bool WritePrinter(IntPtr h, byte[] buf, int len, out int written);
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-    public struct DOCINFO { public string pDocName; public string pOutputFile; public string pDataType; }
-}
-"@
-$h = [IntPtr]::Zero
-if (-not [RawPrint]::OpenPrinter('${safeName}', [ref]$h, [IntPtr]::Zero)) {
-    throw "Cannot open printer '${safeName}' - check the name in Windows Settings > Devices"
-}
-try {
-    $doc = New-Object RawPrint+DOCINFO
-    $doc.pDocName  = "Mr Healthy Order"
-    $doc.pDataType = "RAW"
-    $job = [RawPrint]::StartDocPrinter($h, 1, [ref]$doc)
-    if ($job -le 0) { throw "StartDocPrinter failed" }
-    [RawPrint]::StartPagePrinter($h) | Out-Null
-    $w = 0
-    [RawPrint]::WritePrinter($h, $bytes, $bytes.Length, [ref]$w) | Out-Null
-    [RawPrint]::EndPagePrinter($h) | Out-Null
-    [RawPrint]::EndDocPrinter($h) | Out-Null
-} finally {
-    [RawPrint]::ClosePrinter($h) | Out-Null
-}
-`;
-
-  // UTF-8 BOM so PowerShell 5.1 reads the file as UTF-8 (default is ANSI)
-  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
-  fs.writeFileSync(psFile, Buffer.concat([bom, Buffer.from(script, "utf8")]));
-
-  try {
-    execFileSync("powershell", [
-      "-NoProfile",
-      "-ExecutionPolicy", "Bypass",
-      "-File", psFile,
-    ], { timeout: 10000 });
-  } finally {
-    try { fs.unlinkSync(binFile); } catch {}
-    try { fs.unlinkSync(psFile); } catch {}
-  }
-}
-
 // ── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "127.0.0.1", () => {
   console.log(`Mr. Healthy Print Server v${VERSION}`);
   console.log(`Listening on http://127.0.0.1:${PORT}`);
-  console.log("Press Ctrl+C to stop.");
+  console.log("Press Ctrl+C to stop.\n");
 });
