@@ -114,9 +114,13 @@ function buildReceiptLines(order) {
 
   for (const item of order.items || []) {
     add(`${item.quantity}x  ${item.name}`, { bold: true });
+    if (item.nameEn) add(item.nameEn, { small: true, ltr: true });
     for (const addon of item.selectedAddons || []) {
       const qty = addon.quantity ?? 1;
-      add(`    - ${addon.option?.name ?? ""}${qty > 1 ? ` x${qty}` : ""}`);
+      const addonName = addon.option?.name ?? "";
+      const addonNameEn = addon.option?.nameEn ?? "";
+      add(`    - ${addonName}${qty > 1 ? ` x${qty}` : ""}`);
+      if (addonNameEn) add(`  ${addonNameEn}`, { small: true, ltr: true });
     }
   }
 
@@ -168,6 +172,7 @@ $doc.Add_PrintPage({
     param($s, $e)
 
     $normalFont = New-Object System.Drawing.Font('Tahoma', 9)
+    $smallFont  = New-Object System.Drawing.Font('Tahoma', 8)
     $boldFont   = New-Object System.Drawing.Font('Tahoma', 9,  [System.Drawing.FontStyle]::Bold)
     $titleFont  = New-Object System.Drawing.Font('Tahoma', 13, [System.Drawing.FontStyle]::Bold)
 
@@ -179,6 +184,10 @@ $doc.Add_PrintPage({
     $center = New-Object System.Drawing.StringFormat
     $center.Alignment     = [System.Drawing.StringAlignment]::Center
     $center.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+    $ltr = New-Object System.Drawing.StringFormat
+    $ltr.Alignment     = [System.Drawing.StringAlignment]::Near
+    $ltr.LineAlignment = [System.Drawing.StringAlignment]::Center
 
     $pageW = [float]$e.MarginBounds.Width
     $x     = [float]$e.MarginBounds.Left
@@ -192,11 +201,11 @@ $doc.Add_PrintPage({
             continue
         }
 
-        $font = if ($line.large) { $titleFont } elseif ($line.bold) { $boldFont } else { $normalFont }
-        $fmt  = if ($line.center) { $center } else { $rtl }
+        $font = if ($line.large) { $titleFont } elseif ($line.bold) { $boldFont } elseif ($line.small) { $smallFont } else { $normalFont }
+        $fmt  = if ($line.center) { $center } elseif ($line.ltr) { $ltr } else { $rtl }
         $rect = New-Object System.Drawing.RectangleF($x, $y, $pageW, 28)
         $e.Graphics.DrawString($line.text, $font, [System.Drawing.Brushes]::Black, $rect, $fmt)
-        $y += if ($line.large) { 26 } else { 20 }
+        $y += if ($line.large) { 26 } elseif ($line.small) { 16 } else { 20 }
     }
 })
 
@@ -239,8 +248,9 @@ function sendTcp(host, port, lines) {
     }
     if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x01]));
     if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x01]));
+    else if (line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x00])); // left-align for English
     parts.push(Buffer.from(line.text + "\n", "utf8"));
-    if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x00]));
+    if (line.center || line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x02])); // back to right-align
     if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x00]));
   }
 
@@ -270,8 +280,8 @@ function sendTcp(host, port, lines) {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 
-app.listen(PORT, "127.0.0.1", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Mr. Healthy Print Server v${VERSION}`);
-  console.log(`Listening on http://127.0.0.1:${PORT}`);
+  console.log(`Listening on http://0.0.0.0:${PORT} (all network interfaces)`);
   console.log("Press Ctrl+C to stop.\n");
 });
