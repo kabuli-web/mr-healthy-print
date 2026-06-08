@@ -87,45 +87,92 @@ app.post("/print", async (req, res) => {
   }
 });
 
-// ── Receipt lines builder ────────────────────────────────────────────────────
+// ── Receipt builders ─────────────────────────────────────────────────────────
 
 function buildReceiptLines(order) {
-  const now = new Date().toLocaleString("ar-SA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-    timeZone: "Asia/Riyadh",
-  });
+  if (order.receiptType === "kitchen") return buildKitchenReceipt(order);
+  return buildPrimaryReceipt(order);
+}
 
+// Full receipt — primary printer
+function buildPrimaryReceipt(order) {
   const lines = [];
-  const add = (text, opts = {}) => lines.push({ text, ...opts });
+  const add    = (text, opts = {}) => lines.push({ text, ...opts });
+  const row    = (qty, name, opts = {}) => lines.push({ tableRow: true, qty, name, ...opts });
+  const dine   = order.dineType === "dine_in" ? "محلي" : "سفري";
+  const orderNum = String(order.orderNumber || "").slice(-5);
 
   add("مستر صحي", { bold: true, center: true, large: true });
+  if (order.branchName) add(order.branchName, { center: true });
   add("---");
-  add(`طلب رقم: ${String(order.orderNumber || "").slice(-6)}`);
-  add(`الوقت: ${now}`);
+  add(`رقم الطلب: ${orderNum}`, { bold: true });
+  add(`التاريخ: ${order.printedAt || ""}`);
+  add(`نوع الطلب: ${dine}${order.fulfillmentType === "delivery" ? " — توصيل" : ""}`, { bold: true });
   add("---");
   add(`العميل: ${order.customerName || ""}`);
   if (order.customerPhone) add(`الجوال: ${order.customerPhone}`);
-  if (order.branchName)    add(`الفرع: ${order.branchName}`);
-  if (order.dineType)      add(order.dineType === "dine_in" ? "نوع الطلب: محلي" : "نوع الطلب: سفري");
-  if (order.fulfillmentType === "delivery") add("طريقة التسليم: توصيل");
+  add("---");
+
+  // Table header
+  row("الكمية", "الوجبة", { bold: true });
   add("---");
 
   for (const item of order.items || []) {
-    add(`${item.quantity}x  ${item.name}`, { bold: true });
-    if (item.nameEn) add(item.nameEn, { small: true, ltr: true });
+    row(String(item.quantity), item.name, { bold: true });
+    if (item.nameEn) lines.push({ text: item.nameEn, small: true, ltr: true, indent: true });
+
     for (const addon of item.selectedAddons || []) {
       const qty = addon.quantity ?? 1;
       const addonName = addon.option?.name ?? "";
       const addonNameEn = addon.option?.nameEn ?? "";
-      add(`    - ${addonName}${qty > 1 ? ` x${qty}` : ""}`);
-      if (addonNameEn) add(`  ${addonNameEn}`, { small: true, ltr: true });
+      const freeQty = addon.freeQuantity ?? 0;
+      const paidQty = addon.paidQuantity ?? qty;
+      let label = `  - ${addonName}${qty > 1 ? ` ×${qty}` : ""}`;
+      if (freeQty > 0 && paidQty === 0) label += " (مجاني)";
+      else if (freeQty > 0) label += ` (مجاني ${freeQty})`;
+      add(label, { small: true });
+      if (addonNameEn) add(`    ${addonNameEn}`, { small: true, ltr: true });
     }
   }
 
   add("---");
+  if (order.note) {
+    add(`ملاحظة: ${order.note}`, { bold: true });
+    add("---");
+  }
 
+  return lines;
+}
+
+// Compact receipt — kitchen section printer
+function buildKitchenReceipt(order) {
+  const lines = [];
+  const add  = (text, opts = {}) => lines.push({ text, ...opts });
+  const row  = (qty, name, opts = {}) => lines.push({ tableRow: true, qty, name, ...opts });
+  const dine = order.dineType === "dine_in" ? "محلي 🍽️" : "سفري 🥡";
+  const orderNum = String(order.orderNumber || "").slice(-5);
+
+  add(orderNum, { bold: true, center: true, large: true });
+  add(dine, { bold: true, center: true });
+  add(order.printedAt || "", { center: true, small: true });
+  add(`${order.customerName || ""}`, { center: true });
+  add("---");
+
+  row("الكمية", "الوجبة", { bold: true });
+  add("---");
+
+  for (const item of order.items || []) {
+    row(String(item.quantity), item.name, { bold: true });
+    if (item.nameEn) add(item.nameEn, { small: true, ltr: true });
+
+    for (const addon of item.selectedAddons || []) {
+      const qty = addon.quantity ?? 1;
+      const addonName = addon.option?.name ?? "";
+      add(`  - ${addonName}${qty > 1 ? ` ×${qty}` : ""}`, { small: true });
+    }
+  }
+
+  add("---");
   if (order.note) {
     add(`ملاحظة: ${order.note}`, { bold: true });
     add("---");
@@ -174,7 +221,7 @@ $doc.Add_PrintPage({
     $normalFont = New-Object System.Drawing.Font('Tahoma', 9)
     $smallFont  = New-Object System.Drawing.Font('Tahoma', 8)
     $boldFont   = New-Object System.Drawing.Font('Tahoma', 9,  [System.Drawing.FontStyle]::Bold)
-    $titleFont  = New-Object System.Drawing.Font('Tahoma', 13, [System.Drawing.FontStyle]::Bold)
+    $titleFont  = New-Object System.Drawing.Font('Tahoma', 14, [System.Drawing.FontStyle]::Bold)
 
     $rtl = New-Object System.Drawing.StringFormat
     $rtl.FormatFlags   = [System.Drawing.StringFormatFlags]::DirectionRightToLeft
@@ -193,11 +240,24 @@ $doc.Add_PrintPage({
     $x     = [float]$e.MarginBounds.Left
     $y     = [float]$e.MarginBounds.Top
 
+    $qtyColW = [float]36
+
     foreach ($line in $lines) {
         if ($line.text -eq '---') {
             $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 0.5)
-            $e.Graphics.DrawLine($pen, $x, ($y + 5), ($x + $pageW), ($y + 5))
-            $y += 14
+            $e.Graphics.DrawLine($pen, $x, ($y + 4), ($x + $pageW), ($y + 4))
+            $y += 13
+            continue
+        }
+
+        if ($line.tableRow -eq $true) {
+            $font2   = if ($line.bold) { $boldFont } else { $normalFont }
+            $lineH   = if ($line.bold) { 22 } else { 20 }
+            $qtyRect  = [System.Drawing.RectangleF]::new($x, $y, $qtyColW, $lineH)
+            $nameRect = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4), $y, ($pageW - $qtyColW - 4), $lineH)
+            $e.Graphics.DrawString($line.qty,  $font2, [System.Drawing.Brushes]::Black, $qtyRect,  $center)
+            $e.Graphics.DrawString($line.name, $font2, [System.Drawing.Brushes]::Black, $nameRect, $rtl)
+            $y += $lineH
             continue
         }
 
@@ -205,7 +265,7 @@ $doc.Add_PrintPage({
         $fmt  = if ($line.center) { $center } elseif ($line.ltr) { $ltr } else { $rtl }
         $rect = New-Object System.Drawing.RectangleF($x, $y, $pageW, 28)
         $e.Graphics.DrawString($line.text, $font, [System.Drawing.Brushes]::Black, $rect, $fmt)
-        $y += if ($line.large) { 26 } elseif ($line.small) { 16 } else { 20 }
+        $y += if ($line.large) { 28 } elseif ($line.small) { 16 } else { 20 }
     }
 })
 
@@ -246,11 +306,24 @@ function sendTcp(host, port, lines) {
       parts.push(Buffer.from("--------------------------------\n", "ascii"));
       continue;
     }
+
+    if (line.tableRow) {
+      if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x01]));
+      // qty left-aligned (fixed 4 chars), name right side
+      const qty  = String(line.qty  || "").padEnd(5);
+      const name = String(line.name || "");
+      parts.push(Buffer.from(`${qty} ${name}\n`, "utf8"));
+      if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x00]));
+      continue;
+    }
+
     if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x01]));
+    if (line.large)  parts.push(Buffer.from([GS,  0x21, 0x11])); // double width+height
     if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x01]));
-    else if (line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x00])); // left-align for English
+    else if (line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x00]));
     parts.push(Buffer.from(line.text + "\n", "utf8"));
-    if (line.center || line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x02])); // back to right-align
+    if (line.large)  parts.push(Buffer.from([GS,  0x21, 0x00])); // reset size
+    if (line.center || line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x02]));
     if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x00]));
   }
 
