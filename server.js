@@ -42,33 +42,19 @@ app.get("/printers", (_req, res) => {
 // ── Print order ─────────────────────────────────────────────────────────────
 
 app.post("/print", async (req, res) => {
-  const { printerName, order } = req.body || {};
+  const { printerName, lines } = req.body || {};
 
   if (!printerName)
     return res.status(400).json({ success: false, error: "printerName is required" });
-  if (!order)
-    return res.status(400).json({ success: false, error: "order is required" });
+  if (!Array.isArray(lines))
+    return res.status(400).json({ success: false, error: "lines array is required" });
 
-  // ── Log the job ──
   const ts = new Date().toISOString();
   console.log(`\n╔══ PRINT JOB ${ts} ══╗`);
-  console.log(`  Printer  : ${printerName}`);
-  console.log(`  Order    : ${order.orderNumber}`);
-  console.log(`  Customer : ${order.customerName} / ${order.customerPhone}`);
-  console.log(`  Branch   : ${order.branchName || "-"}`);
-  console.log(`  Type     : ${order.dineType || "-"} / ${order.fulfillmentType || "-"}`);
-  console.log(`  Items    :`);
-  for (const item of order.items || []) {
-    console.log(`    ${item.quantity}x ${item.name}`);
-    for (const a of item.selectedAddons || []) {
-      const qty = a.quantity ?? 1;
-      console.log(`       + ${a.option?.name ?? ""}${qty > 1 ? ` x${qty}` : ""}`);
-    }
-  }
-  if (order.note) console.log(`  Note     : ${order.note}`);
+  console.log(`  Printer : ${printerName}`);
+  console.log(`  Lines   : ${lines.length}`);
 
   try {
-    const lines = buildReceiptLines(order);
 
     if (printerName.toUpperCase().startsWith("TCP:")) {
       const parts = printerName.split(":");
@@ -87,99 +73,9 @@ app.post("/print", async (req, res) => {
   }
 });
 
-// ── Receipt builders ─────────────────────────────────────────────────────────
-
-function buildReceiptLines(order) {
-  if (order.receiptType === "kitchen") return buildKitchenReceipt(order);
-  return buildPrimaryReceipt(order);
-}
-
-// Full receipt — primary printer
-function buildPrimaryReceipt(order) {
-  const lines = [];
-  const add    = (text, opts = {}) => lines.push({ text, ...opts });
-  const row    = (qty, name, opts = {}) => lines.push({ tableRow: true, qty, name, ...opts });
-  const dine   = order.dineType === "dine_in" ? "محلي" : "سفري";
-  const orderNum = String(order.orderNumber || "").slice(-5);
-
-  add("مستر صحي", { bold: true, center: true, large: true });
-  if (order.branchName) add(order.branchName, { center: true });
-  add("---");
-  add(`رقم الطلب: ${orderNum}`, { bold: true });
-  add(`التاريخ: ${order.printedAt || ""}`);
-  add(`نوع الطلب: ${dine}${order.fulfillmentType === "delivery" ? " — توصيل" : ""}`, { bold: true });
-  add("---");
-  add(`العميل: ${order.customerName || ""}`);
-  if (order.customerPhone) add(`الجوال: ${order.customerPhone}`);
-  add("---");
-
-  // Table header
-  row("الكمية", "الوجبة", { bold: true });
-  add("---");
-
-  for (const item of order.items || []) {
-    row(String(item.quantity), item.name, { bold: true });
-    if (item.nameEn) lines.push({ text: item.nameEn, small: true, ltr: true, indent: true });
-
-    for (const addon of item.selectedAddons || []) {
-      const qty = addon.quantity ?? 1;
-      const addonName = addon.option?.name ?? "";
-      const addonNameEn = addon.option?.nameEn ?? "";
-      const freeQty = addon.freeQuantity ?? 0;
-      const paidQty = addon.paidQuantity ?? qty;
-      let label = `  - ${addonName}${qty > 1 ? ` ×${qty}` : ""}`;
-      if (freeQty > 0 && paidQty === 0) label += " (مجاني)";
-      else if (freeQty > 0) label += ` (مجاني ${freeQty})`;
-      add(label, { small: true });
-      if (addonNameEn) add(`    ${addonNameEn}`, { small: true, ltr: true });
-    }
-  }
-
-  add("---");
-  if (order.note) {
-    add(`ملاحظة: ${order.note}`, { bold: true });
-    add("---");
-  }
-
-  return lines;
-}
-
-// Compact receipt — kitchen section printer
-function buildKitchenReceipt(order) {
-  const lines = [];
-  const add  = (text, opts = {}) => lines.push({ text, ...opts });
-  const row  = (qty, name, opts = {}) => lines.push({ tableRow: true, qty, name, ...opts });
-  const dine = order.dineType === "dine_in" ? "محلي 🍽️" : "سفري 🥡";
-  const orderNum = String(order.orderNumber || "").slice(-5);
-
-  add(orderNum, { bold: true, center: true, large: true });
-  add(dine, { bold: true, center: true });
-  add(order.printedAt || "", { center: true, small: true });
-  add(`${order.customerName || ""}`, { center: true });
-  add("---");
-
-  row("الكمية", "الوجبة", { bold: true });
-  add("---");
-
-  for (const item of order.items || []) {
-    row(String(item.quantity), item.name, { bold: true });
-    if (item.nameEn) add(item.nameEn, { small: true, ltr: true });
-
-    for (const addon of item.selectedAddons || []) {
-      const qty = addon.quantity ?? 1;
-      const addonName = addon.option?.name ?? "";
-      add(`  - ${addonName}${qty > 1 ? ` ×${qty}` : ""}`, { small: true });
-    }
-  }
-
-  add("---");
-  if (order.note) {
-    add(`ملاحظة: ${order.note}`, { bold: true });
-    add("---");
-  }
-
-  return lines;
-}
+// ── Windows named-printer via GDI+ (PowerShell) ─────────────────────────────
+// Receipt layout is built by the admin app and sent as a lines array.
+// This server only handles rendering — no order logic here.
 
 // ── Windows named-printer via GDI+ (PowerShell) ─────────────────────────────
 // Windows handles Arabic shaping + RTL — no encoding tricks needed.
@@ -240,7 +136,8 @@ $doc.Add_PrintPage({
     $x     = [float]$e.MarginBounds.Left
     $y     = [float]$e.MarginBounds.Top
 
-    $qtyColW = [float]36
+    $qtyColW   = [float]28
+    $priceColW = [float]55
 
     foreach ($line in $lines) {
         if ($line.text -eq '---') {
@@ -251,12 +148,20 @@ $doc.Add_PrintPage({
         }
 
         if ($line.tableRow -eq $true) {
-            $font2   = if ($line.bold) { $boldFont } else { $normalFont }
-            $lineH   = if ($line.bold) { 22 } else { 20 }
-            $qtyRect  = [System.Drawing.RectangleF]::new($x, $y, $qtyColW, $lineH)
-            $nameRect = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4), $y, ($pageW - $qtyColW - 4), $lineH)
+            $font2  = if ($line.bold) { $boldFont } else { $normalFont }
+            $lineH  = if ($line.bold) { 22 } else { 20 }
+            $hasPrice = $line.price -and $line.price -ne ''
+            $nameW  = if ($hasPrice) { $pageW - $qtyColW - $priceColW - 8 } else { $pageW - $qtyColW - 4 }
+
+            $qtyRect   = [System.Drawing.RectangleF]::new($x, $y, $qtyColW, $lineH)
+            $nameRect  = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4), $y, $nameW, $lineH)
             $e.Graphics.DrawString($line.qty,  $font2, [System.Drawing.Brushes]::Black, $qtyRect,  $center)
             $e.Graphics.DrawString($line.name, $font2, [System.Drawing.Brushes]::Black, $nameRect, $rtl)
+
+            if ($hasPrice) {
+                $priceRect = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4 + $nameW + 4), $y, $priceColW, $lineH)
+                $e.Graphics.DrawString($line.price, $font2, [System.Drawing.Brushes]::Black, $priceRect, $ltr)
+            }
             $y += $lineH
             continue
         }
@@ -309,10 +214,11 @@ function sendTcp(host, port, lines) {
 
     if (line.tableRow) {
       if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x01]));
-      // qty left-aligned (fixed 4 chars), name right side
-      const qty  = String(line.qty  || "").padEnd(5);
-      const name = String(line.name || "");
-      parts.push(Buffer.from(`${qty} ${name}\n`, "utf8"));
+      const qty   = String(line.qty   || "").padEnd(4);
+      const price = line.price ? String(line.price).padStart(10) : "";
+      const name  = String(line.name  || "");
+      const row   = price ? `${qty} ${name.padEnd(18)} ${price}\n` : `${qty} ${name}\n`;
+      parts.push(Buffer.from(row, "utf8"));
       if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x00]));
       continue;
     }
