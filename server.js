@@ -1,25 +1,50 @@
 const express = require("express");
-const cors = require("cors");
-const net = require("net");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+const cors    = require("cors");
+const net     = require("net");
+const fs      = require("fs");
+const os      = require("os");
+const path    = require("path");
 const { execSync, execFile } = require("child_process");
 
-const app = express();
-const PORT = process.env.PORT || 3001;
-const VERSION = "1.0.0";
+const app     = express();
+const PORT    = process.env.PORT || 3001;
+const VERSION = "1.1.0";
+
+// SumatraPDF path — set SUMATRA_PATH env var if not on system PATH
+const SUMATRA = process.env.SUMATRA_PATH || "SumatraPDF";
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// ── Health ──────────────────────────────────────────────────────────────────
+// ── Puppeteer browser (singleton, reused across requests) ─────────────────────
+
+let browser = null;
+
+async function getBrowser() {
+  if (browser) return browser;
+  const puppeteer = require("puppeteer");
+  browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
+  });
+  browser.on("disconnected", () => {
+    console.log("Browser disconnected — will relaunch on next print");
+    browser = null;
+  });
+  console.log("Puppeteer browser ready");
+  return browser;
+}
+
+// Pre-warm on startup
+getBrowser().catch((err) => console.error("Browser pre-warm failed:", err.message));
+
+// ── Health ────────────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, version: VERSION });
 });
 
-// ── List printers ───────────────────────────────────────────────────────────
+// ── List printers ─────────────────────────────────────────────────────────────
 
 app.get("/printers", (_req, res) => {
   try {
@@ -39,228 +64,82 @@ app.get("/printers", (_req, res) => {
   }
 });
 
-// ── Print order ─────────────────────────────────────────────────────────────
+// ── Print ─────────────────────────────────────────────────────────────────────
 
 app.post("/print", async (req, res) => {
-  const { printerName, lines } = req.body || {};
+  const { printerName, html } = req.body || {};
 
   if (!printerName)
     return res.status(400).json({ success: false, error: "printerName is required" });
-  if (!Array.isArray(lines))
-    return res.status(400).json({ success: false, error: "lines array is required" });
+  if (!html)
+    return res.status(400).json({ success: false, error: "html is required" });
 
   const ts = new Date().toISOString();
   console.log(`\n╔══ PRINT JOB ${ts} ══╗`);
   console.log(`  Printer : ${printerName}`);
-  console.log(`  Lines   : ${lines.length}`);
+
+  const pdfFile = path.join(os.tmpdir(), `mrh_${Date.now()}.pdf`);
 
   try {
-
     if (printerName.toUpperCase().startsWith("TCP:")) {
-      const parts = printerName.split(":");
-      await sendTcp(parts[1], parseInt(parts[2]) || 9100, lines);
-    } else {
-      await sendWindowsPrinter(printerName, lines);
+      // TCP ESC/POS path — not supported with HTML, log a warning
+      return res.status(400).json({ success: false, error: "TCP printers not supported with HTML receipts" });
     }
 
-    console.log(`  Result   : SUCCESS`);
+    // 1. Render HTML → PDF via Puppeteer
+    const b    = await getBrowser();
+    const page = await b.newPage();
+    try {
+      await page.setContent(html, { waitUntil: "networkidle0", timeout: 10000 });
+      const pdf = await page.pdf({
+        width:           "80mm",
+        printBackground: true,
+        margin:          { top: "0", bottom: "0", left: "0", right: "0" },
+      });
+      fs.writeFileSync(pdfFile, pdf);
+    } finally {
+      await page.close();
+    }
+
+    // 2. Print PDF via SumatraPDF
+    await printPdf(pdfFile, printerName);
+
+    console.log(`  Result  : SUCCESS`);
     console.log(`╚${"═".repeat(50)}╝`);
     res.json({ success: true });
   } catch (err) {
-    console.error(`  Result   : FAILED — ${err.message}`);
+    console.error(`  Result  : FAILED — ${err.message}`);
     console.log(`╚${"═".repeat(50)}╝`);
     res.status(500).json({ success: false, error: err.message });
+  } finally {
+    try { fs.unlinkSync(pdfFile); } catch {}
   }
 });
 
-// ── Windows named-printer via GDI+ (PowerShell) ─────────────────────────────
-// Receipt layout is built by the admin app and sent as a lines array.
-// This server only handles rendering — no order logic here.
+// ── SumatraPDF print helper ───────────────────────────────────────────────────
 
-// ── Windows named-printer via GDI+ (PowerShell) ─────────────────────────────
-// Windows handles Arabic shaping + RTL — no encoding tricks needed.
-
-function sendWindowsPrinter(printerName, lines) {
-  const id = Date.now();
-  const jsonFile = path.join(os.tmpdir(), `mrh_${id}.json`);
-  const psFile   = path.join(os.tmpdir(), `mrh_${id}.ps1`);
-
-  // Write JSON with UTF-8 BOM so PowerShell reads it correctly
-  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
-  fs.writeFileSync(jsonFile, Buffer.concat([bom, Buffer.from(JSON.stringify(lines), "utf8")]));
-
-  const safeJson    = jsonFile.replace(/\\/g, "\\\\");
-  const safePrinter = printerName.replace(/'/g, "''");
-
-  const script = `
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Drawing
-
-$lines = [System.IO.File]::ReadAllText('${safeJson}', [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-
-$doc = New-Object System.Drawing.Printing.PrintDocument
-$doc.PrinterSettings.PrinterName = '${safePrinter}'
-
-if (-not $doc.PrinterSettings.IsValid) {
-    throw "Printer not found: '${safePrinter}'"
-}
-
-# 80 mm wide = ~227 points (at 72 dpi) but PrintDocument uses hundredths of an inch
-# 80 mm = 3.15 inch = 315 units; height 2000 = 20 inch (thermal scrolls)
-$doc.DefaultPageSettings.PaperSize    = New-Object System.Drawing.Printing.PaperSize('Receipt', 315, 2000)
-$doc.DefaultPageSettings.Margins      = New-Object System.Drawing.Printing.Margins(15, 15, 10, 10)
-$doc.DefaultPageSettings.Landscape    = $false
-
-$doc.Add_PrintPage({
-    param($s, $e)
-
-    $normalFont = New-Object System.Drawing.Font('Tahoma', 9)
-    $smallFont  = New-Object System.Drawing.Font('Tahoma', 8)
-    $boldFont   = New-Object System.Drawing.Font('Tahoma', 9,  [System.Drawing.FontStyle]::Bold)
-    $titleFont  = New-Object System.Drawing.Font('Tahoma', 14, [System.Drawing.FontStyle]::Bold)
-
-    $rtl = New-Object System.Drawing.StringFormat
-    $rtl.FormatFlags   = [System.Drawing.StringFormatFlags]::DirectionRightToLeft
-    $rtl.Alignment     = [System.Drawing.StringAlignment]::Near
-    $rtl.LineAlignment = [System.Drawing.StringAlignment]::Center
-
-    $center = New-Object System.Drawing.StringFormat
-    $center.Alignment     = [System.Drawing.StringAlignment]::Center
-    $center.LineAlignment = [System.Drawing.StringAlignment]::Center
-
-    $ltr = New-Object System.Drawing.StringFormat
-    $ltr.Alignment     = [System.Drawing.StringAlignment]::Near
-    $ltr.LineAlignment = [System.Drawing.StringAlignment]::Center
-
-    $pageW = [float]$e.MarginBounds.Width
-    $x     = [float]$e.MarginBounds.Left
-    $y     = [float]$e.MarginBounds.Top
-
-    $qtyColW   = [float]28
-    $priceColW = [float]55
-
-    foreach ($line in $lines) {
-        if ($line.text -eq '---') {
-            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 0.5)
-            $e.Graphics.DrawLine($pen, $x, ($y + 4), ($x + $pageW), ($y + 4))
-            $y += 13
-            continue
-        }
-
-        if ($line.tableRow -eq $true) {
-            $font2  = if ($line.bold) { $boldFont } else { $normalFont }
-            $lineH  = if ($line.bold) { 22 } else { 20 }
-            $hasPrice = $line.price -and $line.price -ne ''
-            $nameW  = if ($hasPrice) { $pageW - $qtyColW - $priceColW - 8 } else { $pageW - $qtyColW - 4 }
-
-            $qtyRect   = [System.Drawing.RectangleF]::new($x, $y, $qtyColW, $lineH)
-            $nameRect  = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4), $y, $nameW, $lineH)
-            $e.Graphics.DrawString($line.qty,  $font2, [System.Drawing.Brushes]::Black, $qtyRect,  $center)
-            $e.Graphics.DrawString($line.name, $font2, [System.Drawing.Brushes]::Black, $nameRect, $rtl)
-
-            if ($hasPrice) {
-                $priceRect = [System.Drawing.RectangleF]::new(($x + $qtyColW + 4 + $nameW + 4), $y, $priceColW, $lineH)
-                $e.Graphics.DrawString($line.price, $font2, [System.Drawing.Brushes]::Black, $priceRect, $ltr)
-            }
-            $y += $lineH
-            continue
-        }
-
-        $font = if ($line.large) { $titleFont } elseif ($line.bold) { $boldFont } elseif ($line.small) { $smallFont } else { $normalFont }
-        $fmt  = if ($line.center) { $center } elseif ($line.ltr) { $ltr } else { $rtl }
-        $rect = New-Object System.Drawing.RectangleF($x, $y, $pageW, 28)
-        $e.Graphics.DrawString($line.text, $font, [System.Drawing.Brushes]::Black, $rect, $fmt)
-        $y += if ($line.large) { 28 } elseif ($line.small) { 16 } else { 20 }
-    }
-})
-
-$doc.Print()
-$doc.Dispose()
-`;
-
-  const bom2 = Buffer.from([0xef, 0xbb, 0xbf]);
-  fs.writeFileSync(psFile, Buffer.concat([bom2, Buffer.from(script, "utf8")]));
-
-  // -STA: Single Threaded Apartment — required for GDI/System.Drawing in headless PS
-  // execFile (async) so multiple print jobs run in parallel, not sequentially
+function printPdf(pdfPath, printerName) {
   return new Promise((resolve, reject) => {
+    // -print-to targets a specific Windows printer by name
+    // -print-settings "fit" scales content to fit the paper
+    // -silent suppresses any UI dialogs
     execFile(
-      "powershell",
-      ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", psFile],
+      SUMATRA,
+      ["-print-to", printerName, "-print-settings", "fit,portrait", "-silent", pdfPath],
       { timeout: 20000 },
       (err) => {
-        try { fs.unlinkSync(jsonFile); } catch {}
-        try { fs.unlinkSync(psFile);   } catch {}
-        if (err) reject(err);
+        if (err) reject(new Error(`SumatraPDF: ${err.message}`));
         else resolve();
       }
     );
   });
 }
 
-// ── TCP raw ESC/POS sender ────────────────────────────────────────────────────
-// Sends UTF-8 bytes — requires the printer to have UTF-8 mode enabled.
-
-function sendTcp(host, port, lines) {
-  const ESC = 0x1b;
-  const GS  = 0x1d;
-  const parts = [Buffer.from([ESC, 0x40])]; // initialize
-
-  for (const line of lines) {
-    if (line.text === "---") {
-      parts.push(Buffer.from("--------------------------------\n", "ascii"));
-      continue;
-    }
-
-    if (line.tableRow) {
-      if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x01]));
-      const qty   = String(line.qty   || "").padEnd(4);
-      const price = line.price ? String(line.price).padStart(10) : "";
-      const name  = String(line.name  || "");
-      const row   = price ? `${qty} ${name.padEnd(18)} ${price}\n` : `${qty} ${name}\n`;
-      parts.push(Buffer.from(row, "utf8"));
-      if (line.bold) parts.push(Buffer.from([ESC, 0x45, 0x00]));
-      continue;
-    }
-
-    if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x01]));
-    if (line.large)  parts.push(Buffer.from([GS,  0x21, 0x11])); // double width+height
-    if (line.center) parts.push(Buffer.from([ESC, 0x61, 0x01]));
-    else if (line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x00]));
-    parts.push(Buffer.from(line.text + "\n", "utf8"));
-    if (line.large)  parts.push(Buffer.from([GS,  0x21, 0x00])); // reset size
-    if (line.center || line.ltr) parts.push(Buffer.from([ESC, 0x61, 0x02]));
-    if (line.bold)   parts.push(Buffer.from([ESC, 0x45, 0x00]));
-  }
-
-  parts.push(Buffer.from([GS, 0x56, 0x41, 0x10])); // full cut
-
-  const buffer = Buffer.concat(parts);
-
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host, port });
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`TCP timeout connecting to ${host}:${port}`));
-    }, 5000);
-    socket.on("connect", () => {
-      socket.write(buffer, () => {
-        clearTimeout(timer);
-        socket.end();
-        resolve();
-      });
-    });
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-// ── Start ───────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Mr. Healthy Print Server v${VERSION}`);
-  console.log(`Listening on http://0.0.0.0:${PORT} (all network interfaces)`);
+  console.log(`Listening on http://0.0.0.0:${PORT}`);
+  console.log(`SumatraPDF path: ${SUMATRA}`);
   console.log("Press Ctrl+C to stop.\n");
 });
