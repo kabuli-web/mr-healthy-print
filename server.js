@@ -559,7 +559,23 @@ function savePrintedOrders(set) {
 
 const printedOrders = loadPrintedOrders();
 
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+function startHeartbeat() {
+  const write = () => {
+    db.collection("serverStatus").doc(BRANCH_ID).set({
+      lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+      version: VERSION,
+      branchId: BRANCH_ID,
+    }).catch(err => console.error("[heartbeat] failed:", err.message));
+  };
+  write();
+  setInterval(write, 30_000);
+}
+
 // ── Firestore listeners ───────────────────────────────────────────────────────
+
+const STARTUP_TIME = Date.now();
 
 function startListeners() {
   console.log(`\nWatching orders for branch: ${BRANCH_ID}`);
@@ -583,17 +599,29 @@ function startListeners() {
       }
     }, (err) => console.error("[orders listener error]", err.message));
 
-  // Manual reprint: printJobs written by admin
+  // Manual reprint: printJobs written by admin — skip jobs older than 60s
   db.collection("printJobs")
     .where("branchId", "==", BRANCH_ID)
     .where("status", "==", "pending")
     .onSnapshot((snap) => {
       for (const change of snap.docChanges()) {
         if (change.type !== "added") continue;
-        const jobId  = change.doc.id;
-        const job    = change.doc.data();
-        console.log(`\n[JOB] reprint request for order ${job.orderId}`);
+        const jobId = change.doc.id;
+        const job   = change.doc.data();
 
+        const jobTime = job.requestedAt?.toMillis?.() ?? 0;
+        const ageMs   = Date.now() - jobTime;
+        if (ageMs > 60_000) {
+          console.log(`[JOB] skipping stale job (${Math.round(ageMs / 1000)}s old)`);
+          db.collection("printJobs").doc(jobId).update({
+            status: "failed",
+            error: "Job was too old when server processed it",
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }).catch(() => {});
+          continue;
+        }
+
+        console.log(`\n[JOB] reprint request for order ${job.orderId}`);
         db.collection("orders").doc(job.orderId).get().then(async (orderSnap) => {
           if (!orderSnap.exists) throw new Error("order not found");
           await printOrder({ id: orderSnap.id, ...orderSnap.data() });
@@ -612,9 +640,19 @@ function startListeners() {
         });
       }
     }, (err) => console.error("[printJobs listener error]", err.message));
+
+  // Restart command listener
+  db.collection("serverCommands").doc(BRANCH_ID).onSnapshot((snap) => {
+    if (!snap.exists) return;
+    const data = snap.data();
+    if (data.command === "restart" && data.status === "pending") {
+      console.log("[command] restart received — restarting...");
+      snap.ref.update({ status: "acknowledged" }).finally(() => process.exit(0));
+    }
+  }, (err) => console.error("[commands listener error]", err.message));
 }
 
-// ── HTTP endpoints (health + printers only) ───────────────────────────────────
+// ── HTTP endpoints ────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, version: VERSION, branchId: BRANCH_ID });
@@ -633,6 +671,206 @@ app.get("/printers", (_req, res) => {
   }
 });
 
+app.get("/jobs", async (_req, res) => {
+  try {
+    const snap = await db.collection("printJobs")
+      .where("branchId", "==", BRANCH_ID)
+      .orderBy("requestedAt", "desc")
+      .limit(30)
+      .get();
+    const jobs = snap.docs.map(d => {
+      const j = d.data();
+      return {
+        id: d.id,
+        orderId: j.orderId,
+        status: j.status,
+        error: j.error ?? null,
+        requestedAt: j.requestedAt?.toMillis?.() ?? null,
+        completedAt: j.completedAt?.toMillis?.() ?? null,
+      };
+    });
+    res.json({ jobs });
+  } catch (err) {
+    res.json({ jobs: [], error: err.message });
+  }
+});
+
+app.post("/restart", (_req, res) => {
+  res.json({ ok: true });
+  setTimeout(() => process.exit(0), 200);
+});
+
+app.get("/", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(DASHBOARD_HTML);
+});
+
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>مستر صحي — خادم الطباعة</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Tahoma, Arial, sans-serif; background: #f0f4f0; color: #1a2e1a; direction: rtl; }
+  header { background: #003628; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 20px; }
+  header .ver { font-size: 12px; opacity: 0.7; margin-right: auto; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #4ade80; flex-shrink: 0; box-shadow: 0 0 6px #4ade80; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px; display: grid; gap: 16px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 15px; color: #003628; margin-bottom: 12px; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
+  .info-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .info-item { font-size: 13px; }
+  .info-item span { color: #6b7280; }
+  .info-item strong { display: block; font-size: 16px; margin-top: 2px; }
+  .printer-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .printer-chip { background: #e8f5e9; color: #1b5e20; padding: 4px 12px; border-radius: 20px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #f9fafb; padding: 8px 10px; text-align: right; font-weight: 600; color: #374151; border-bottom: 2px solid #e5e7eb; }
+  td { padding: 8px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+  .badge-done { background: #dcfce7; color: #166534; }
+  .badge-pending { background: #fef9c3; color: #92400e; }
+  .badge-failed { background: #fee2e2; color: #991b1b; }
+  .error-text { color: #dc2626; font-size: 12px; margin-top: 3px; }
+  .btn-restart { background: #dc2626; color: #fff; border: none; padding: 10px 22px; border-radius: 6px; font-size: 14px; font-family: inherit; cursor: pointer; }
+  .btn-restart:hover { background: #b91c1c; }
+  .btn-restart:disabled { opacity: 0.5; cursor: default; }
+  #restart-msg { margin-top: 8px; font-size: 13px; color: #dc2626; }
+  .refresh-note { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+  #uptime { font-size: 13px; color: #6b7280; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div>
+  <h1>مستر صحي — خادم الطباعة</h1>
+  <div class="ver" id="ver-branch">جاري التحميل...</div>
+</header>
+<main>
+  <div class="card">
+    <h2>حالة الخادم</h2>
+    <div class="info-row" id="status-row">
+      <div class="info-item"><span>الحالة</span><strong style="color:#16a34a">يعمل ✓</strong></div>
+      <div class="info-item"><span>الفرع</span><strong id="s-branch">—</strong></div>
+      <div class="info-item"><span>الإصدار</span><strong id="s-version">—</strong></div>
+      <div class="info-item"><span id="uptime-label">وقت التشغيل</span><strong id="s-uptime">—</strong></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>الطابعات المتاحة</h2>
+    <div class="printer-list" id="printer-list">جاري التحميل...</div>
+  </div>
+
+  <div class="card">
+    <h2>آخر طلبات الطباعة اليدوية</h2>
+    <table>
+      <thead><tr><th>الطلب</th><th>الحالة</th><th>وقت الطلب</th><th>وقت الإنجاز</th></tr></thead>
+      <tbody id="jobs-body"><tr><td colspan="4" style="color:#9ca3af;text-align:center">جاري التحميل...</td></tr></tbody>
+    </table>
+    <div class="refresh-note">يتحدث تلقائياً كل 15 ثانية</div>
+  </div>
+
+  <div class="card">
+    <h2>إعادة تشغيل الخادم</h2>
+    <p style="font-size:13px;color:#6b7280;margin-bottom:12px">سيتوقف الخادم ويعاد تشغيله تلقائياً عبر NSSM. قد تستغرق العملية 5-10 ثوانٍ.</p>
+    <button class="btn-restart" id="restart-btn" onclick="doRestart()">إعادة التشغيل</button>
+    <div id="restart-msg"></div>
+  </div>
+</main>
+
+<script>
+  const startTime = Date.now();
+
+  function fmt(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    return d.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  }
+
+  function fmtUptime(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return (h ? h + 'س ' : '') + (m ? m + 'د ' : '') + sec + 'ث';
+  }
+
+  function badgeHtml(status) {
+    const cls = status === 'done' ? 'badge-done' : status === 'pending' ? 'badge-pending' : 'badge-failed';
+    const label = status === 'done' ? 'تم' : status === 'pending' ? 'قيد الانتظار' : 'فشل';
+    return '<span class="badge ' + cls + '">' + label + '</span>';
+  }
+
+  async function loadHealth() {
+    try {
+      const r = await fetch('/health');
+      const d = await r.json();
+      document.getElementById('s-branch').textContent = d.branchId || '—';
+      document.getElementById('s-version').textContent = 'v' + (d.version || '—');
+      document.getElementById('ver-branch').textContent = 'فرع: ' + (d.branchId || '—') + '  |  v' + (d.version || '');
+    } catch {}
+  }
+
+  async function loadPrinters() {
+    try {
+      const r = await fetch('/printers');
+      const d = await r.json();
+      const el = document.getElementById('printer-list');
+      if (!d.printers || !d.printers.length) { el.textContent = 'لا توجد طابعات'; return; }
+      el.innerHTML = d.printers.map(p => '<div class="printer-chip">' + p + '</div>').join('');
+    } catch {}
+  }
+
+  async function loadJobs() {
+    try {
+      const r = await fetch('/jobs');
+      const d = await r.json();
+      const tbody = document.getElementById('jobs-body');
+      if (!d.jobs || !d.jobs.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:#9ca3af;text-align:center">لا توجد طلبات طباعة بعد</td></tr>';
+        return;
+      }
+      tbody.innerHTML = d.jobs.map(j => {
+        const errRow = j.error ? '<div class="error-text">' + j.error + '</div>' : '';
+        return '<tr><td>' + (j.orderId || j.id).slice(-8) + errRow + '</td><td>' + badgeHtml(j.status) + '</td><td>' + fmt(j.requestedAt) + '</td><td>' + fmt(j.completedAt) + '</td></tr>';
+      }).join('');
+    } catch {}
+  }
+
+  function updateUptime() {
+    document.getElementById('s-uptime').textContent = fmtUptime(Date.now() - startTime);
+  }
+
+  async function doRestart() {
+    const btn = document.getElementById('restart-btn');
+    const msg = document.getElementById('restart-msg');
+    btn.disabled = true;
+    msg.textContent = 'جاري إرسال أمر إعادة التشغيل...';
+    try {
+      await fetch('/restart', { method: 'POST' });
+      msg.textContent = 'تم إرسال الأمر. سيعاد تشغيل الخادم خلال لحظات. أعد تحديث الصفحة بعد 10 ثوانٍ.';
+      setTimeout(() => location.reload(), 8000);
+    } catch {
+      msg.textContent = 'تعذر الاتصال بالخادم.';
+      btn.disabled = false;
+    }
+  }
+
+  async function refresh() {
+    await Promise.all([loadPrinters(), loadJobs()]);
+  }
+
+  loadHealth();
+  refresh();
+  setInterval(refresh, 15000);
+  setInterval(updateUptime, 1000);
+</script>
+</body>
+</html>`;
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
@@ -640,5 +878,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Listening on http://0.0.0.0:${PORT}`);
   getBrowser().catch(err => console.error("Browser pre-warm failed:", err.message));
   psWorker.start();
+  startHeartbeat();
   startListeners();
 });
