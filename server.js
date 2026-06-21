@@ -576,6 +576,19 @@ function startHeartbeat() {
 // ── Firestore listeners ───────────────────────────────────────────────────────
 
 const STARTUP_TIME = Date.now();
+let lastSnapshotAt = Date.now();
+
+function startWatchdog() {
+  const STALE_MS = 10 * 60 * 1000; // 10 minutes
+  setInterval(() => {
+    const stale = Date.now() - lastSnapshotAt;
+    if (stale > STALE_MS) {
+      console.error(`[watchdog] no snapshot in ${Math.round(stale / 60000)}min — restarting`);
+      process.exit(0);
+    }
+  }, 60_000);
+  console.log("[watchdog] started (10min stale threshold)");
+}
 
 function startListeners() {
   console.log(`\nWatching orders for branch: ${BRANCH_ID}`);
@@ -585,6 +598,7 @@ function startListeners() {
     .where("fulfillment.branchId", "==", BRANCH_ID)
     .where("status", "in", ["accepted", "preparing"])
     .onSnapshot((snap) => {
+      lastSnapshotAt = Date.now();
       for (const change of snap.docChanges()) {
         if (change.type !== "added") continue;
         const orderId = change.doc.id;
@@ -604,6 +618,7 @@ function startListeners() {
     .where("branchId", "==", BRANCH_ID)
     .where("status", "==", "pending")
     .onSnapshot((snap) => {
+      lastSnapshotAt = Date.now();
       for (const change of snap.docChanges()) {
         if (change.type !== "added") continue;
         const jobId = change.doc.id;
@@ -880,4 +895,5 @@ app.listen(PORT, "0.0.0.0", () => {
   psWorker.start();
   startHeartbeat();
   startListeners();
+  startWatchdog();
 });
